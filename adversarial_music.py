@@ -8,6 +8,7 @@ import theano
 import theano.tensor as T
 import numpy as np
 import datetime
+import os
 
 import constants
 import leadsheet as ls
@@ -16,6 +17,9 @@ TRAINING_DIR = "/home/sam/misc_code/adversarial_music/data/ii-V-I_leadsheets"
 OUTPUT_DIR = "/home/sam/misc_code/adversarial_music/output/" + str(datetime.datetime.now())
 NUM_SAMPLES_PER_TIMESTEP = 20
 MAX_NUM_BATCHES = 250
+
+UPBOUND = .65
+LOWBOUND = .35
 
 circleofthirds_bits = 13
 
@@ -255,6 +259,7 @@ def build_discriminator(layer_sizes):
 
 
 def build_and_train_GAN():
+	os.mkdir(OUTPUT_DIR)
 	print "Loading data..."
 	chords, melodies = load_data()
 	print "Building the model..."
@@ -266,10 +271,14 @@ def build_and_train_GAN():
 	for batch in range(1, MAX_NUM_BATCHES):
 		# for each piece
 		print "Batch ", batch
+		pause_d_training, pause_g_training = False, False
+		j = 0
 		for c,m in zip(chords, melodies):
-			j = 0
 			ghidden_state = None
 			dhidden_state = None
+			best_g = []
+			worst_g = []
+			j+=1
 			# for each timestep
 			for cstep, mstep in zip(c,m):
 				# generate samples
@@ -280,18 +289,28 @@ def build_and_train_GAN():
 					r, _ = dpass(cstep, samples[i], dhidden_state)
 					results[i] = r[1] # certainty that it is real
 				# update generator based on results
-				gupd(grads, results)
+				if not pause_g_training: gupd(grads, results)
 				# train discriminator on the best generated timestep
-				best = np.argmax(results)
-				j+=1
-				if j%40 == 0:
-					print "Timestep ", j
-					print "Generator best: ", results[best]
 
+				best = np.argmax(results)
+				worst = np.argmin(results)
+				best_g += [results[best]]
+				worst_g += [results[worst]]
 				dtrain(cstep, samples[best], 0, dhidden_state)
 				# train discriminator on the correct timestep
-				dcost, dhidden_state = dtrain(cstep, mstep, 1, dhidden_state)
-				if j%40 == 0: print "Discriminator cost: ", dcost
+				if pause_d_training: _, dhidden_state = dpass(cstep, mstep, 1, dhidden_state)
+				else: dcost, dhidden_state = dtrain(cstep, mstep, 1, dhidden_state)
+			#check whether we should pause training for one network based on how good/bad the generated results are relative
+			avg_best = np.mean(np.array(best_g))
+			avg_worst = np.mean(np.array(worst_g))
+			pause_g_training = avg_worst > UPBOUND
+			pause_d_training = avg_best < LOWBOUND
+			if j % 100 == 0:
+				print "Piece ", j
+				print "Average best generated timestep: ", avg_best
+				print "Average worst generated timestep: ", avg_worst
+
+
 		# Every 10 batches, output a piece
 		if batch % 10 == 0:
 			gen_melody = []
