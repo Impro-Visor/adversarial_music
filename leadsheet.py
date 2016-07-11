@@ -1,7 +1,7 @@
 # leadsheet.py
 # stolen from Daniel Johnson
 # use parse_leadsheet --- returns two lists.
-# first list, chords, is a list of pairs of root and zeroes and ones for notes in the chord relative to the root
+# first list, chords, is a list of pairs of root and zeros and ones for notes in the chord relative to the root
 # IMPORTANT: each list index represents a timestep forward, so a measure is 48 list indicies
 # second list, melody, is a list of pairs of midi note number and duration
 
@@ -126,7 +126,6 @@ def parse_leadsheet(fn,verbose=False):
     with open(fn,'r') as f:
         contents = "\n".join(f.readlines())
     parsed = sexpdata.loads("({})".format(contents.replace("'","")))
-
     parts = [('default','',[])]
     for p in parsed:
         if not isinstance(p, list):

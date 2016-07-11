@@ -6,18 +6,25 @@ from os import listdir
 from theano_lstm import *
 import theano
 import theano.tensor as T
+import numpy as np
+import datetime
 
 import constants
+import leadsheet as ls
 
-TRAINING_DIR = "todo"
+TRAINING_DIR = "/home/sam/misc_code/adversarial_music/data/ii-V-I_leadsheets"
+OUTPUT_DIR = "/home/sam/misc_code/adversarial_music/output/" + str(datetime.datetime.now())
 NUM_SAMPLES_PER_TIMESTEP = 20
+MAX_NUM_BATCHES = 250
+
+circleofthirds_bits = 13
 
 # converts a midi number and duration to an array of generator outputs formatted in circle of thirds encoding
 # first four bits correspond to minor thirds, next three correspond to major thirds - a note is specified by exactly two of these. Next three bits are octave bits, low to high
 # There is also a rest bit, a sustain bit and an articulate bit (total of 13 bits for output per timestep and 48 timesteps per measure)
 # if the sustain bit is on, the melody sustains. If the rest bit is on, it rests, if the articulate bit is on, we look at the other bits to figure out what to do
-def pitchduration_to_circleofthirds(duration, pitch):
-	note = np.zeros([duration//10, 13])
+def pitchduration_to_circleofthirds(pitch, duration):
+	note = np.zeros([duration, 13]) # our granularity is 48 timesteps/measure of 4/4, not 480
 	if pitch == None:
 		note[:, 10] = 1
 	else:
@@ -31,7 +38,7 @@ def pitchduration_to_circleofthirds(duration, pitch):
 		note[1:,11] = 1 # sustain for all of the note except the first timestep
 	return note
 
-# converts a list of timesteps with the 12 bit circle of thirds encoding to a list of duration/pitch tuples
+# converts a list of timesteps with the 13 bit circle of thirds encoding to a list of duration/pitch tuples
 def circleofthirds_to_pitchduration(notes):
 	note_splits = np.argmin(notes[:,11]) # all of the timesteps where we either rest or articulate
 	durations = np.array([])
@@ -66,29 +73,37 @@ def circleofthirds_helper(minor, major):
 	elif minor == 3 and major == 2: return 11
 
 def softmax_circleofthirds(arr):
-	return T.append((T.nnet.softmax(arr[:4]), 
+	return T.concatenate((T.nnet.softmax(arr[:4]), 
 									   T.nnet.softmax(arr[4:7]), 
 									   T.nnet.softmax(arr[7:10]), 
-									   T.nnet.softmax(arr[10:])))
+									   T.nnet.softmax(arr[10:13])), axis=1)[0]
 
 # symbolically sample from a circle of thirds representation. 
 #If num_samples=1 it will return a single circle of thirds encoding, otherwise it will return an array of shape [num_samples, 13]
-def sample_from_circleofthirds_probabilities(dist, rng, num_samples=1): 
-	sample = T.zeros([num_samples, dist.shape])
-	ones = ones_like(dist)
-	minor = rng.choice(size=[num_samples], a=T.arange(0,4), dist[:4])
+def sample_from_circleofthirds_probabilities(dist, rng, num_samples=1):
+	sample = [T.zeros(dist.shape)]*num_samples
+	minor = rng.choice(size=[num_samples], a=T.arange(0,4), p=dist[:4])
 	major = rng.choice(size=[num_samples], a=T.arange(4,7), p=dist[4:7])
 	octave = rng.choice(size=[num_samples], a=T.arange(7,10), p=dist[7:10])
 	state = rng.choice(size=[num_samples], a=T.arange(10,13), p=dist[10:])
-	sample[:,minor] = ones[minor]
-	sample[:,major] = ones[major]
-	sample[:,octave] = ones[octave]
-	sample[:,state] = ones[state]
-	return sample if sample.shape()[0] > 1 else sample[0]
+	for i in range(num_samples):
+		sample[i] = T.set_subtensor(sample[i][minor[i]], 1)
+		sample[i] = T.set_subtensor(sample[i][major[i]], 1)
+		sample[i] = T.set_subtensor(sample[i][octave[i]], 1)
+		sample[i] = T.set_subtensor(sample[i][state[i]], 1)
+	return sample
 
 def load_data():
+	chords = []
+	melodies = []
 	for file in listdir(TRAINING_DIR):
-		pass # TODO
+		c, m = ls.parse_leadsheet(TRAINING_DIR + "/" + file)
+		for i in range(len(c)):
+			c[i] = c[i][1] + [c[i][0]]
+		chords+= [c]
+		for note in m:
+			melodies += [pitchduration_to_circleofthirds(note[0], note[1])]
+	return chords, melodies
 
 
 
@@ -96,48 +111,203 @@ def load_data():
 # Then, I sample from that distribution, get notes and save the gradients to increase the probability of those notes somewhere. Then, I feed that note into the discriminator, and if it fools it, I update according to that gradient
 # the issue is that a single note will always fool the discriminator. Maybe I should scale the adjustment with the number of timesteps it fools the discriminator by?
 
-def build_generator():
+# apologies for the nonsense with lists, numpy arrays and theano tensors. Be careful about your types if modifying!
+def build_generator(layer_sizes):
 	rng = T.shared_randomstreams.RandomStreams()
 
-	prior = rng.uniform(size=(12)) # the random prior to keep things interesting, let's say it's a vector of 12 numbers
-	chord = T.matrix('chord') # each chord is a 12 element array with one hot for notes
-
-	# model - for now just one hidden layer and an output layer
-	model = StackedCells(24, celltype=LSTM, layers=[50, 13], activation=T.tanh)
-	model.layers[0].in_gate2.activation = lambda x: x # we don't want to tanh the input, also in_gate2 is the layer within an LSTM layer that actually accepts input from the previous layer
-
-	timesteps = chord.shape[0]
-	outputs_info = [dict(initial=layer.initial_hidden_state, taps=[-1]) for layer in model.layers if hasattr(layer, 'initial_hidden_state')] + [None]
-
-	# using scan, we need a function to execute each timestep
-	def step(input, *prev_hiddens):
-		new_states = model.forward(x, prev_hiddens)
-		# we output the new state of the network and the real output at each timestep to be fed back into the network
-		return new_states + [softmax_circle_of_thirds(new_states[-1])]
-
-	results, updates = theano.scan(step, n_steps=timesteps, outputs_info=outputs_info)
-	# cost is a bit weird
+	prior = rng.uniform(size=[13]) # the random prior to keep things interesting, let's say it's a vector of 13 numbers
+	chord = T.vector('chord') # each chord is a 13 element array with one hot for notes and the root as a midi number
 	
 
-	samples = sample_from_circleofthirds_probabilities(results[-1][1], rng, num_samples=NUM_SAMPLES_PER_TIMESTEP) # this should be the softmaxes from step
-	costs = -T.log(T.sum(results[-1][1][samples == 1]))
+	# model - for now just one hidden layer and an output layer
+	model = StackedCells(26, celltype=LSTM, layers=layer_sizes, activation=T.tanh)
+	model.layers[0].in_gate2.activation = lambda x: x # we don't want to tanh the input, also in_gate2 is the layer within an LSTM layer that actually accepts input from the previous layer
 
-	grads = [T.grad(cost, params)] for cost in costs
+	# I have no idea how to pass None into forward the first time, so I copied the code from theano_lstm to intialize the hiddens. If you call init_gen_pass, it'll use these
+	init_hiddens = [(T.repeat(T.shape_padleft(layer.initial_hidden_state),
+                                      T.concatenate((prior, chord)).shape[0], axis=0)
+                             if T.concatenate((prior, chord)).ndim > 1 else layer.initial_hidden_state)
+                            if hasattr(layer, 'initial_hidden_state') else None
+                            for layer in model.layers]
 
-	rewards = T.vector('rewards') # the output from the discriminator: how certain the discriminator was that the generated timestep was real
+	prev_hiddens = [T.vector() for layer in model.layers]
+
+	
+	# I'm trying to use this without scan. We'll see if it works
+	new_hiddens = model.forward(T.concatenate((prior, chord)), prev_hiddens)
+
+	result = softmax_circleofthirds(new_hiddens[-1][-layer_sizes[-1]:])
+	# grads are a bit weird, we need to take samples first, then save the gradients with respect to the cost of the samples, but we wait to see which we apply and by how much
+	# samples is a python list of theano vectors here for the sake of readability
+	samples = sample_from_circleofthirds_probabilities(result, rng, NUM_SAMPLES_PER_TIMESTEP)
+
+
+	# calculate the gradient with respect to each sample
+	grads = [T.grad(T.sum(-T.log(result[sample==1])), model.params) for sample in samples]
+
+
+
+	rewards = [T.scalar() for grad in grads] # the output from the discriminator: how certain the discriminator was that the generated timestep was real
 	# there should be one reward per sample
-	log_rewards = T.log(rewards)
+	log_rewards = [T.log(reward) for reward in rewards]
 
-	# dot should take the n x m matrix of gradients and multiply it by the length n vector of log rewards, then sum up the gradients with respect to each parameter 
-	# scaled by the rewards, giving us a length m vector of updates
-	weighted_grads = T.dot(grads, log_rewards)
+	weighted_grads = []
+	# I wanted to take the product of a matrix and a vector here, but grads shouldn't be a matrix, it should be a list of lists of vectors :(
+	for i in range(len(grads[0])):
+		weighted_grads += [sum(grads[j][i] * rewards[j] for j in range(len(grads)))]
+
 
 	# copied from Jonathan Raiman's sample code, I don't need to use gsums, xsums, lr or max_norm
 	# I don't need to put in costs because I have my custom gradient set up
-	updates, gsums, xsums, lr, max_norm = create_optimization_updates(None, model.params, method='sgd', grads=weighted_grads)
+	updates, gsums, xsums, lr, max_norm = create_optimization_updates(None, model.params, method='sgd', gradients=weighted_grads)
 
+	
+	
 	# function for a generative pass - returns list of samples for the next timestep
-	# Problem: what about internal state? Do I even want to be using scan? Or should I be calling the discriminator within step? I'm currently doing this all wrong
-	generative_pass = theano.function([chord], [samples,grads])
+	hiddens_len = len(new_hiddens)
+	samples_len = len(samples)
 
-	update_pass = theano.function([grads, rewards], update=updates)
+	generative_pass = theano.function([chord] + prev_hiddens, samples + new_hiddens + [item for sublist in grads for item in sublist]) # some wizardry from stackoverflow
+	init_gen_pass = theano.function([chord], samples + new_hiddens + [item for sublist in grads for item in sublist], 
+									givens={prev_hidden:init_hidden for prev_hidden, init_hidden in zip(prev_hiddens, init_hiddens)})
+
+	# theano doesn't like returning lists from functions, so this wrapper makes generative_pass work the way I want it to
+	def generative_pass_wrapper(chord, prev_hiddens):
+		if prev_hiddens != None: 
+			raw_in = [chord, prev_hiddens[0]]
+			for hid in prev_hiddens[1:]:
+				raw_in += [hid]
+		raw_output = np.array(apply(generative_pass, raw_in)) if prev_hiddens != None else np.array(init_gen_pass(chord))
+		samples = raw_output[:samples_len]
+		new_hiddens = raw_output[samples_len:samples_len+hiddens_len]
+		grads = raw_output[samples_len+hiddens_len:]
+		return samples, new_hiddens, grads
+
+
+	# function for updating the generator, doesn't return anything, but applies gradients. Separate from generative_pass so that I can regulate timesteps between updates
+	update_pass = theano.function([item for sublist in grads for item in sublist] + rewards, updates=updates)
+
+	def update_pass_wrapper(grads, rewards):
+		apply(update_pass, np.append(grads, rewards))
+
+	return generative_pass_wrapper, update_pass_wrapper
+
+# the discriminator should take in a melody timestep, a chord and its internal state and get a certainty of it being real
+def build_discriminator(layer_sizes):
+	chord = T.vector('chord') # should be a 13 bit vector
+	melody = T.vector('melody') # 13 bits for one hot and root
+	isreal = T.iscalar('isreal?') # 1 if real, 0 if fake - necessary for training
+
+	
+
+	model = StackedCells(26, celltype=LSTM, layers=layer_sizes, activation=T.tanh) # outputs real or fake, 2 bits
+	model.layers[0].in_gate2.activation = lambda x: x
+
+	init_hiddens = [(T.repeat(T.shape_padleft(layer.initial_hidden_state),
+                                      T.concatenate((chord, melody)).shape[0], axis=0)
+                             if T.concatenate((chord, melody)).ndim > 1 else layer.initial_hidden_state)
+                            if hasattr(layer, 'initial_hidden_state') else None
+                            for layer in model.layers]
+
+	prev_hiddens = [T.vector() for layer in model.layers]
+
+	new_hiddens = model.forward(T.concatenate((chord, melody)), prev_hiddens)
+	raw_result = new_hiddens[-1]
+	result = T.nnet.softmax(raw_result[-layer_sizes[-1]:])
+
+	# cost is the negative log liklihood that the correct answer (real or not) was chosen, I have no idea why result is 2d
+	cost = -T.mean(T.log(result[0][isreal]))
+
+	theano.grad(cost, model.params)
+
+	updates, gsums, xsums, lr, max_norm = create_optimization_updates(cost, model.params, method='sgd')
+	forward_pass = theano.function([chord, melody] + prev_hiddens, [result] + new_hiddens)
+	init_fd_pass = theano.function([chord, melody], [result] + new_hiddens, 
+									givens={prev_hidden:init_hidden for prev_hidden, init_hidden in zip(prev_hiddens, init_hiddens)})
+
+	def forward_pass_wrapper(chord, melody, prev_hiddens):
+		if prev_hiddens != None: 
+			raw_in = [chord, melody, prev_hiddens[0]]
+			for hid in prev_hiddens[1:]:
+				raw_in += [hid]
+		raw_output = np.array(apply(forward_pass, raw_in)) if prev_hiddens != None else np.array(init_fd_pass(chord, melody))
+		result = raw_output[0][0]
+		new_hiddens = raw_output[1:]
+		return result, new_hiddens
+
+	training_pass = theano.function([chord, melody, isreal] + prev_hiddens, [cost] + new_hiddens, updates=updates, allow_input_downcast=True)
+	init_tr_pass = theano.function([chord, melody, isreal], [cost] + new_hiddens, updates=updates, 
+									givens={prev_hidden:init_hidden for prev_hidden, init_hidden in zip(prev_hiddens, init_hiddens)}, allow_input_downcast=True)
+
+	def training_pass_wrapper(chord, melody, isreal, prev_hiddens):
+		if prev_hiddens != None: 
+			raw_in = [chord, melody, isreal, prev_hiddens[0]]
+			for hid in prev_hiddens[1:]:
+				raw_in += [hid]
+			raw_output = apply(training_pass, raw_in)
+			
+		else:
+			raw_output = init_tr_pass(chord, melody, isreal)
+		cost = raw_output[0]
+		new_hiddens = raw_output[1:]
+		return cost, new_hiddens
+	return forward_pass_wrapper, training_pass_wrapper
+
+
+def build_and_train_GAN():
+	print "Loading data..."
+	chords, melodies = load_data()
+	print "Building the model..."
+	ggen, gupd = build_generator([50, 50, 50, circleofthirds_bits])
+	dpass, dtrain = build_discriminator([50,2])
+
+	print "Training"
+
+	for batch in range(1, MAX_NUM_BATCHES):
+		# for each piece
+		print "Batch ", batch
+		for c,m in zip(chords, melodies):
+			j = 0
+			ghidden_state = None
+			dhidden_state = None
+			# for each timestep
+			for cstep, mstep in zip(c,m):
+				# generate samples
+				samples, ghidden_state, grads = ggen(cstep, ghidden_state)
+				# pass them through the discriminator
+				results = np.zeros(len(samples))
+				for i in range(len(samples)): 
+					r, _ = dpass(cstep, samples[i], dhidden_state)
+					results[i] = r[1] # certainty that it is real
+				# update generator based on results
+				gupd(grads, results)
+				# train discriminator on the best generated timestep
+				best = np.argmax(results)
+				j+=1
+				if j%40 == 0:
+					print "Timestep ", j
+					print "Generator best: ", results[best]
+
+				dtrain(cstep, samples[best], 0, dhidden_state)
+				# train discriminator on the correct timestep
+				dcost, dhidden_state = dtrain(cstep, mstep, 1, dhidden_state)
+				if j%40 == 0: print "Discriminator cost: ", dcost
+		# Every 10 batches, output a piece
+		if batch % 10 == 0:
+			gen_melody = []
+			ghidden_state = None
+			dhidden_state = None
+			# for each timestep, generate a bunch of melody timesteps
+			for cstep in chords[0]:
+				samples, ghidden_state, _ = ggen(cstep, ghidden_state)
+				# take the best one, according to the discriminator
+				for i in range(len(samples)):
+					r, _ = dpass(cstep, samples[i], dhidden_state)
+					results[i] = r[1]
+				best = np.argmax(results)
+				gen_melody += samples[best]
+				_, dhidden_state = dpass(cstep, samples[best], dhidden_state)
+			pitchduration_melody = circleofthirds_to_pitchduration(np.array(gen_melody))
+			ls.write_leadsheet(chords[0], pitchduration_melody, OUTPUT_DIR + "Batch_" + str(batch))
+
+build_and_train_GAN()
