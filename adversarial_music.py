@@ -9,6 +9,7 @@ import theano.tensor as T
 import numpy as np
 import datetime
 import os
+import pickle
 
 import constants
 import leadsheet as ls
@@ -17,6 +18,7 @@ TRAINING_DIR = "/home/sam/misc_code/adversarial_music/data/ii-V-I_leadsheets"
 OUTPUT_DIR = "/home/sam/misc_code/adversarial_music/output/" + str(datetime.datetime.now())
 NUM_SAMPLES_PER_TIMESTEP = 20
 MAX_NUM_BATCHES = 250
+VERBOSE = False
 
 UPBOUND = .65
 LOWBOUND = .35
@@ -34,7 +36,10 @@ def pitchduration_to_circleofthirds(pitch, duration):
 	else:
 		minor_third = pitch % 4
 		major_third = pitch % 3
-		octave = pitch//12 - 5 # (60 is middle C, 12 notes per octave)
+		octave = pitch//12 - 4 # (60 is middle C, 12 notes per octave)
+		if octave > 2: 
+			if VERBOSE: print "Warning, note was rounded down"
+			octave = 2
 		note[:, minor_third] = 1
 		note[:, 4 + major_third] = 1
 		note[:, 7 + octave] = 1
@@ -44,37 +49,42 @@ def pitchduration_to_circleofthirds(pitch, duration):
 
 # converts a list of timesteps with the 13 bit circle of thirds encoding to a list of duration/pitch tuples
 def circleofthirds_to_pitchduration(notes):
-	note_splits = np.argmin(notes[:,11]) # all of the timesteps where we either rest or articulate
+	note_splits = np.arange(len(notes))[notes[:,11] == 0] # all of the timesteps where we either rest or articulate
+	note_splits = np.append(note_splits, len(notes))
 	durations = np.array([])
 	pitches = np.array([])
-	for i in range(len(note_splits)-1):
+	i = 0
+	while i < len(note_splits)-1:
 		note = notes[note_splits[i]]
 		if note[10] == 1: # we have a rest, we can skip a bunch of values of i now
-			np.append(pitches, None)
-			np.append(durations, 10)
-			while note_splits[i][10] == 1:
+			pitches = np.append(pitches, None)
+			durations = np.append(durations, 0)
+			while notes[note_splits[i]][10] == 1:
 				i+=1
-				durations[-1]+=10
+				durations[-1]+=1
+				if note_splits[i] == len(notes): break
 		else: # we have a real note, we need to do some manipulation
-			durations[i] = (note_splits[i+1] - note_splits[i]) * 10
-			pitch_categories = np.argmax(note[:10])
-			np.append(pitches, 60 + 12 * pitch_categories[2] + circle_of_thirds_helper(pitch_categories[0], pitch_categories[1]))
-	return durations,pitches
+			durations = np.append(durations, note_splits[i+1] - note_splits[i])
+			pitch_categories = np.int32(np.arange(10)[note[:10] == 1])
+			pitches = np.append(pitches, int(48 + 12 * (pitch_categories[2]-7) + circleofthirds_helper(pitch_categories[0], pitch_categories[1])))
+			if pitches[-1] is float: print "WTF????"
+		i+=1
+	return [(pitch, duration) for pitch, duration in zip(pitches.tolist(), np.int32(durations))]
 
 # I can't find a good mathematical way to do this, so I hardcoded it
 def circleofthirds_helper(minor, major):
-	if   minor == 0 and major == 0: return 0
-	elif minor == 1 and major == 1: return 1
-	elif minor == 2 and major == 2: return 2
-	elif minor == 3 and major == 0: return 3
-	elif minor == 0 and major == 1: return 4
-	elif minor == 1 and major == 2: return 5
-	elif minor == 2 and major == 0: return 6
-	elif minor == 3 and major == 1: return 7
-	elif minor == 0 and major == 2: return 8
-	elif minor == 1 and major == 0: return 9
-	elif minor == 2 and major == 1: return 10
-	elif minor == 3 and major == 2: return 11
+	if   minor == 0 and major == 4: return 0
+	elif minor == 1 and major == 5: return 1
+	elif minor == 2 and major == 6: return 2
+	elif minor == 3 and major == 4: return 3
+	elif minor == 0 and major == 5: return 4
+	elif minor == 1 and major == 6: return 5
+	elif minor == 2 and major == 4: return 6
+	elif minor == 3 and major == 5: return 7
+	elif minor == 0 and major == 6: return 8
+	elif minor == 1 and major == 4: return 9
+	elif minor == 2 and major == 5: return 10
+	elif minor == 3 and major == 6: return 11
 
 def softmax_circleofthirds(arr):
 	return T.concatenate((T.nnet.softmax(arr[:4]), 
@@ -97,16 +107,27 @@ def sample_from_circleofthirds_probabilities(dist, rng, num_samples=1):
 		sample[i] = T.set_subtensor(sample[i][state[i]], 1)
 	return sample
 
-def load_data():
-	chords = []
-	melodies = []
-	for file in listdir(TRAINING_DIR):
-		c, m = ls.parse_leadsheet(TRAINING_DIR + "/" + file)
+def load_data(directory=TRAINING_DIR):
+	chords = np.array([])
+	melodies = np.array([])
+	for file in listdir(directory):
+		c, m = ls.parse_leadsheet(directory + "/" + file)
 		for i in range(len(c)):
-			c[i] = c[i][1] + [c[i][0]]
-		chords+= [c]
+			c[i] = c[i][1] + [c[i][0]] # deal with the root of the chord
+		if len(chords) == 0:
+			chords = np.array([c])
+		else:
+			chords = np.append(chords, [c], axis=0)
+		temp_melodies = np.array([])
 		for note in m:
-			melodies += [pitchduration_to_circleofthirds(note[0], note[1])]
+			if len(temp_melodies) == 0:
+				temp_melodies = np.array(pitchduration_to_circleofthirds(note[0], note[1]))
+			else:
+				temp_melodies = np.append(temp_melodies, pitchduration_to_circleofthirds(note[0], note[1]), axis=0)
+		if len(melodies) == 0:
+			melodies = np.array([temp_melodies])
+		else:
+			melodies = np.append(melodies, [temp_melodies], axis=0)
 	return chords, melodies
 
 
@@ -153,7 +174,8 @@ def build_generator(layer_sizes):
 
 	rewards = [T.scalar() for grad in grads] # the output from the discriminator: how certain the discriminator was that the generated timestep was real
 	# there should be one reward per sample
-	log_rewards = [T.log(reward) for reward in rewards]
+
+	mean = T.mean(T.stack(rewards))
 
 	weighted_grads = []
 	# I wanted to take the product of a matrix and a vector here, but grads shouldn't be a matrix, it should be a list of lists of vectors :(
@@ -163,7 +185,7 @@ def build_generator(layer_sizes):
 
 	# copied from Jonathan Raiman's sample code, I don't need to use gsums, xsums, lr or max_norm
 	# I don't need to put in costs because I have my custom gradient set up
-	updates, gsums, xsums, lr, max_norm = create_optimization_updates(None, model.params, method='sgd', gradients=weighted_grads)
+	updates, gsums, xsums, lr, max_norm = create_optimization_updates(None, model.params, method='adagrad', gradients=weighted_grads)
 
 	
 	
@@ -171,17 +193,17 @@ def build_generator(layer_sizes):
 	hiddens_len = len(new_hiddens)
 	samples_len = len(samples)
 
-	generative_pass = theano.function([chord] + prev_hiddens, samples + new_hiddens + [item for sublist in grads for item in sublist]) # some wizardry from stackoverflow
+	generative_pass = theano.function([chord] + prev_hiddens, samples + new_hiddens + [item for sublist in grads for item in sublist], allow_input_downcast=True) # some wizardry from stackoverflow
 	init_gen_pass = theano.function([chord], samples + new_hiddens + [item for sublist in grads for item in sublist], 
-									givens={prev_hidden:init_hidden for prev_hidden, init_hidden in zip(prev_hiddens, init_hiddens)})
+									givens={prev_hidden:init_hidden for prev_hidden, init_hidden in zip(prev_hiddens, init_hiddens)}, allow_input_downcast=True)
 
 	# theano doesn't like returning lists from functions, so this wrapper makes generative_pass work the way I want it to
 	def generative_pass_wrapper(chord, prev_hiddens):
-		if prev_hiddens != None: 
+		if prev_hiddens is not None: 
 			raw_in = [chord, prev_hiddens[0]]
 			for hid in prev_hiddens[1:]:
 				raw_in += [hid]
-		raw_output = np.array(apply(generative_pass, raw_in)) if prev_hiddens != None else np.array(init_gen_pass(chord))
+		raw_output = np.array(apply(generative_pass, raw_in)) if prev_hiddens is not None else np.array(init_gen_pass(chord))
 		samples = raw_output[:samples_len]
 		new_hiddens = raw_output[samples_len:samples_len+hiddens_len]
 		grads = raw_output[samples_len+hiddens_len:]
@@ -194,7 +216,7 @@ def build_generator(layer_sizes):
 	def update_pass_wrapper(grads, rewards):
 		apply(update_pass, np.append(grads, rewards))
 
-	return generative_pass_wrapper, update_pass_wrapper
+	return model, generative_pass_wrapper, update_pass_wrapper
 
 # the discriminator should take in a melody timestep, a chord and its internal state and get a certainty of it being real
 def build_discriminator(layer_sizes):
@@ -224,17 +246,17 @@ def build_discriminator(layer_sizes):
 
 	theano.grad(cost, model.params)
 
-	updates, gsums, xsums, lr, max_norm = create_optimization_updates(cost, model.params, method='sgd')
-	forward_pass = theano.function([chord, melody] + prev_hiddens, [result] + new_hiddens)
+	updates, gsums, xsums, lr, max_norm = create_optimization_updates(cost, model.params, method='adagrad')
+	forward_pass = theano.function([chord, melody] + prev_hiddens, [result] + new_hiddens, allow_input_downcast=True)
 	init_fd_pass = theano.function([chord, melody], [result] + new_hiddens, 
-									givens={prev_hidden:init_hidden for prev_hidden, init_hidden in zip(prev_hiddens, init_hiddens)})
+									givens={prev_hidden:init_hidden for prev_hidden, init_hidden in zip(prev_hiddens, init_hiddens)}, allow_input_downcast=True)
 
 	def forward_pass_wrapper(chord, melody, prev_hiddens):
-		if prev_hiddens != None: 
+		if prev_hiddens is not None: 
 			raw_in = [chord, melody, prev_hiddens[0]]
 			for hid in prev_hiddens[1:]:
 				raw_in += [hid]
-		raw_output = np.array(apply(forward_pass, raw_in)) if prev_hiddens != None else np.array(init_fd_pass(chord, melody))
+		raw_output = np.array(apply(forward_pass, raw_in)) if prev_hiddens is not None else np.array(init_fd_pass(chord, melody))
 		result = raw_output[0][0]
 		new_hiddens = raw_output[1:]
 		return result, new_hiddens
@@ -244,7 +266,7 @@ def build_discriminator(layer_sizes):
 									givens={prev_hidden:init_hidden for prev_hidden, init_hidden in zip(prev_hiddens, init_hiddens)}, allow_input_downcast=True)
 
 	def training_pass_wrapper(chord, melody, isreal, prev_hiddens):
-		if prev_hiddens != None: 
+		if prev_hiddens is not None: 
 			raw_in = [chord, melody, isreal, prev_hiddens[0]]
 			for hid in prev_hiddens[1:]:
 				raw_in += [hid]
@@ -255,24 +277,70 @@ def build_discriminator(layer_sizes):
 		cost = raw_output[0]
 		new_hiddens = raw_output[1:]
 		return cost, new_hiddens
-	return forward_pass_wrapper, training_pass_wrapper
+	return model, forward_pass_wrapper, training_pass_wrapper
 
+# save the weights from a model to a filepath
+def save_weights(model, filepath):
+	params = []
+	for p in model.params:
+		params += [p.get_value()]
+	pickle.dump(params, open(filepath, 'w'))
 
-def build_and_train_GAN():
-	os.mkdir(OUTPUT_DIR)
+# load weights saved with save_weights and assign them to the given model
+# currently no way to save the network shape
+def load_model_from_weights(model, filepath):
+	new_params = pickle.load(open(filepath))
+	layer_sizes = new_params[0]
+	for i in range(1, len(model.params)):
+		assert len(new_params[i]) == model.params[i-1].get_value().shape[0]
+		model.params[i-1].set_value(new_params[i])
+
+# generate output from the network: chords are the chords to solo over, ggen is a function like generative_pass_wrapper above, dpass is like forward_pass_wrapper above
+def generate_sample_output(chords, ggen, dpass, output_directory=OUTPUT_DIR):
+	# for each timestep, generate a bunch of melody timesteps
+	for cstep in chords:
+		samples, ghidden_state, _ = ggen(cstep, ghidden_state)
+		# take the best one, according to the discriminator
+		results = np.zeros(len(samples))
+		for i in range(len(samples)):
+			r, _ = dpass(cstep, samples[i], dhidden_state)
+			results[i] = r[1]
+		best = np.argmax(results)
+		gen_melody += [samples[best].tolist()]
+		_, dhidden_state = dpass(cstep, samples[best], dhidden_state)
+	pitchduration_melody = circleofthirds_to_pitchduration(np.int32(np.array(gen_melody)))
+	for i in range(len(pitchduration_melody)):
+		if pitchduration_melody[i][0] is not None:
+			pitchduration_melody[i] = (int(pitchduration_melody[i][0]), pitchduration_melody[i][1])
+	chords_for_ls = [(chord[-1], list(chord[:-1])) for chord in chords[0]]
+	ls.write_leadsheet(chords_for_ls, pitchduration_melody, output_directory + "/Batch_" + str(batch) + ".ls")
+
+def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None, dweight_file=None):
+	
 	print "Loading data..."
-	chords, melodies = load_data()
+	chords, melodies = load_data(training_data_directory)
 	print "Building the model..."
-	ggen, gupd = build_generator([50, 50, 50, circleofthirds_bits])
-	dpass, dtrain = build_discriminator([50,2])
+	gmodel, ggen, gupd = build_generator([100, 200, 100, circleofthirds_bits])
+	dmodel, dpass, dtrain = build_discriminator([100,50, 2])
+
+	if gweight_file is not None:
+		load_model_from_weights(gmodel, gweight_file)
+	if dweight_file is not None:
+		load_model_from_weights(dmodel, dweight_file)
+
+	batch = 0
+
+	gen_melody = []
+	ghidden_state = None
+	dhidden_state = None
+	os.mkdir(OUTPUT_DIR)
 
 	print "Training"
-
 	for batch in range(1, MAX_NUM_BATCHES):
-		# for each piece
 		print "Batch ", batch
 		pause_d_training, pause_g_training = False, False
 		j = 0
+		# for each piece
 		for c,m in zip(chords, melodies):
 			ghidden_state = None
 			dhidden_state = None
@@ -296,9 +364,9 @@ def build_and_train_GAN():
 				worst = np.argmin(results)
 				best_g += [results[best]]
 				worst_g += [results[worst]]
-				dtrain(cstep, samples[best], 0, dhidden_state)
+				if not pause_d_training: dtrain(cstep, samples[best], 0, dhidden_state)
 				# train discriminator on the correct timestep
-				if pause_d_training: _, dhidden_state = dpass(cstep, mstep, 1, dhidden_state)
+				if pause_d_training: _, dhidden_state = dpass(cstep, mstep, dhidden_state)
 				else: dcost, dhidden_state = dtrain(cstep, mstep, 1, dhidden_state)
 			#check whether we should pause training for one network based on how good/bad the generated results are relative
 			avg_best = np.mean(np.array(best_g))
@@ -309,24 +377,15 @@ def build_and_train_GAN():
 				print "Piece ", j
 				print "Average best generated timestep: ", avg_best
 				print "Average worst generated timestep: ", avg_worst
+				if not pause_d_training: print "Current dcost: ", dcost
 
 
-		# Every 10 batches, output a piece
-		if batch % 10 == 0:
-			gen_melody = []
-			ghidden_state = None
-			dhidden_state = None
-			# for each timestep, generate a bunch of melody timesteps
-			for cstep in chords[0]:
-				samples, ghidden_state, _ = ggen(cstep, ghidden_state)
-				# take the best one, according to the discriminator
-				for i in range(len(samples)):
-					r, _ = dpass(cstep, samples[i], dhidden_state)
-					results[i] = r[1]
-				best = np.argmax(results)
-				gen_melody += samples[best]
-				_, dhidden_state = dpass(cstep, samples[best], dhidden_state)
-			pitchduration_melody = circleofthirds_to_pitchduration(np.array(gen_melody))
-			ls.write_leadsheet(chords[0], pitchduration_melody, OUTPUT_DIR + "Batch_" + str(batch))
+		# Every 10 batches, store weights and output a piece
+		if batch %10 == 0:
+			save_weights(gmodel, OUTPUT_DIR + "/Gweights_Batch_" + str(batch) + ".p")
+			save_weights(dmodel, OUTPUT_DIR + "/Dweights_Batch_" + str(batch) + ".p")
+			generate_sample_output(chords[0], ggen, dpass)
+			
 
-build_and_train_GAN()
+if __name__=='__main__':
+	build_and_train_GAN()
