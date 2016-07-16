@@ -16,7 +16,7 @@ import leadsheet as ls
 
 TRAINING_DIR = "/home/sam/misc_code/adversarial_music/data/ii-V-I_leadsheets"
 OUTPUT_DIR = "/home/sam/misc_code/adversarial_music/output/" + str(datetime.datetime.now())
-NUM_SAMPLES_PER_TIMESTEP = 20
+NUM_SAMPLES_PER_TIMESTEP = 1
 MAX_NUM_BATCHES = 250
 VERBOSE = False
 TRAINING_METHOD = 'adadelta'
@@ -108,6 +108,22 @@ def sample_from_circleofthirds_probabilities(dist, rng, num_samples=1):
 		sample[i] = T.set_subtensor(sample[i][state[i]], 1)
 	return sample
 
+def gen_possible_circleofthirds_notes():
+	note_possibilities = np.zeros([4*3*3+2, 13])
+	n = 0
+	for i in range(4):
+		for j in range(4,7):
+			for k in range(7,10):
+				note_possibilities[n][i] = 1
+				note_possibilities[n][j] = 1
+				note_possibilities[n][k] = 1
+				note_possibilities[n][12] = 1
+				n+=1
+	note_possibilities[n][10] = 1
+	n += 1
+	note_possibilities[n][11] = 1
+	return note_possibilities
+
 def load_data(directory=TRAINING_DIR):
 	chords = np.array([])
 	melodies = np.array([])
@@ -163,7 +179,50 @@ def build_generator(layer_sizes):
 	new_hiddens = model.forward(T.concatenate((prior, chord)), prev_hiddens)
 
 	result = softmax_circleofthirds(new_hiddens[-1][-layer_sizes[-1]:])
-	# grads are a bit weird, we need to take samples first, then save the gradients with respect to the cost of the samples, but we wait to see which we apply and by how much
+
+	samples = sample_from_circleofthirds_probabilities(result, rng, NUM_SAMPLES_PER_TIMESTEP)
+
+	generative_pass = theano.function([chord] + prev_hiddens, samples + new_hiddens, allow_input_downcast=True) # no gradients returned 
+	init_gen_pass = theano.function([chord], samples + new_hiddens, 
+									givens={prev_hidden:init_hidden for prev_hidden, init_hidden in zip(prev_hiddens, init_hiddens)}, allow_input_downcast=True)
+
+	samples_len = len(samples)
+
+	def generative_pass_wrapper(chord, prev_hiddens=None):
+		if prev_hiddens is not None: 
+			raw_in = [chord, prev_hiddens[0]]
+			for hid in prev_hiddens[1:]:
+				raw_in += [hid]
+		raw_output = np.array(apply(generative_pass, raw_in)) if prev_hiddens is not None else np.array(init_gen_pass(chord))
+		samples = raw_output[:samples_len]
+		new_hiddens = raw_output[samples_len:]
+		return samples, new_hiddens
+
+	# now we want to do gradient with respect to some given desired output
+	quality_of_each_output = T.vector('quality')
+
+	probability_of_each_output = T.prod(result[] ,axis=1)
+
+	cost = -T.log(T.dot(quality_of_each_output, probability_of_each_output))
+
+	updates, gsums, xsums, lr, max_norm = create_optimization_updates(cost, model.params, method=TRAINING_METHOD)
+
+	training_pass = theano.function([chord, desired_output] + prev_hiddens, [cost] + new_hiddens, updates=updates, allow_input_downcast=True)
+	init_tr_pass = theano.function([chord, desired_output], [cost] + new_hiddens, updates=updates, 
+		givens={prev_hidden:init_hidden for prev_hidden, init_hidden in zip(prev_hiddens, init_hiddens)}, allow_input_downcast=True)
+
+	def training_pass_wrapper(chord, desired_output, prev_hiddens=None):
+		if prev_hiddens is not None: 
+			raw_in = [chord, desired_output, prev_hiddens[0]]
+			for hid in prev_hiddens[1:]:
+				raw_in += [hid]
+		raw_output = apply(training_pass, raw_in) if prev_hiddens is not None else init_tr_pass(chord, desired_output)
+		cost = raw_output[0]
+		new_hiddens = raw_output[1:]
+		return cost, new_hiddens
+	return model, generative_pass_wrapper, training_pass_wrapper
+
+	"""# grads are a bit weird, we need to take samples first, then save the gradients with respect to the cost of the samples, but we wait to see which we apply and by how much
 	# samples is a python list of theano vectors here for the sake of readability
 	samples = sample_from_circleofthirds_probabilities(result, rng, NUM_SAMPLES_PER_TIMESTEP)
 
@@ -217,7 +276,7 @@ def build_generator(layer_sizes):
 	def update_pass_wrapper(grads, rewards):
 		apply(update_pass, np.append(grads, rewards))
 
-	return model, generative_pass_wrapper, update_pass_wrapper
+	return model, generative_pass_wrapper, update_pass_wrapper"""
 
 # the discriminator should take in a melody timestep, a chord and its internal state and get a certainty of it being real
 def build_discriminator(layer_sizes):
@@ -290,14 +349,15 @@ def save_weights(model, filepath):
 # load weights saved with save_weights and assign them to the given model
 # currently no way to save the network shape
 def load_model_from_weights(model, filepath):
-	print "loading from ", filepath
 	new_params = pickle.load(open(filepath))
-	for i in range(0, len(model.params)):
+	for i in range(1, len(model.params)):
+		print new_params[i].shape
+		print model.params[i].get_value().shape
 		assert len(new_params[i]) == model.params[i].get_value().shape[0]
 		model.params[i].set_value(new_params[i])
 
 # generate output from the network: chords are the chords to solo over, ggen is a function like generative_pass_wrapper above, dpass is like forward_pass_wrapper above
-def generate_sample_output(chords, ggen, dpass, batch, output_directory=OUTPUT_DIR):
+def generate_sample_output(chords, ggen, dpass, output_directory=OUTPUT_DIR):
 	# for each timestep, generate a bunch of melody timesteps
 	ghidden_state = None
 	dhidden_state = None
@@ -316,15 +376,15 @@ def generate_sample_output(chords, ggen, dpass, batch, output_directory=OUTPUT_D
 	for i in range(len(pitchduration_melody)):
 		if pitchduration_melody[i][0] is not None:
 			pitchduration_melody[i] = (int(pitchduration_melody[i][0]), pitchduration_melody[i][1])
-	chords_for_ls = [(chord[-1], list(chord[:-1])) for chord in chords]
+	chords_for_ls = [(chord[-1], list(chord[:-1])) for chord in chords[0]]
 	ls.write_leadsheet(chords_for_ls, pitchduration_melody, output_directory + "/Batch_" + str(batch) + ".ls")
 
-def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None, dweight_file=None, start_batch=1):
+def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None, dweight_file=None):
 	
 	print "Loading data..."
 	chords, melodies = load_data(training_data_directory)
 	print "Building the model..."
-	gmodel, ggen, gupd = build_generator([100, 200, 100, circleofthirds_bits])
+	gmodel, gpass, gtrain = build_generator([100, 200, 100, circleofthirds_bits])
 	dmodel, dpass, dtrain = build_discriminator([100,50, 2])
 
 	if gweight_file is not None:
@@ -332,31 +392,50 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 	if dweight_file is not None:
 		load_model_from_weights(dmodel, dweight_file)
 
+	batch = 0
 
 	gen_melody = []
 	ghidden_state = None
-	dhidden_state = None
+	dhidden_state_real = None
+	dhidden_state_generated = None
 	os.mkdir(OUTPUT_DIR)
 
 	print "Training"
-	for batch in range(start_batch, MAX_NUM_BATCHES):
-		# Every 10 batches, store weights and output a piece
-		if batch %10 == 0:
-			save_weights(gmodel, OUTPUT_DIR + "/Gweights_Batch_" + str(batch) + ".p")
-			save_weights(dmodel, OUTPUT_DIR + "/Dweights_Batch_" + str(batch) + ".p")
-			generate_sample_output(chords[0], ggen, dpass, batch)
+
+	every_possible_output = gen_possible_circleofthirds_notes() # NOTE: set every_possible_output[-1]'s first 10 bits to the previous timestep's
+
+	for batch in range(1, MAX_NUM_BATCHES):
 		print "Batch ", batch
 		pause_d_training, pause_g_training = False, False
 		j = 0
 		# for each piece
 		for c,m in zip(chords, melodies):
 			ghidden_state = None
-			dhidden_state = None
+			dhidden_state_real = None
+			dhidden_state_generated = None
 			best_g = []
 			worst_g = []
 			j+=1
 			# for each timestep
 			for cstep, mstep in zip(c,m):
+				# so we're not generating samples from the generator, so we train the discriminator first
+				results = np.zeros(every_possible_output.shape[0])
+				for i in range(len(every_possible_output)):
+					r, _ = dpass(cstep, every_possible_output[i], dhidden_state_generated)
+					results[i] = r[1]
+				best = np.argmax(results)
+				worst = np.argmin(results)
+				best_g += [results[best]]
+				worst_g += [results[worst]]
+				if not pause_g_training: gtrain(cstep, every_possible_output[best], ghidden_state)
+				sample, ghidden_state = gpass(cstep, ghidden_state)
+				if not pause_d_training:
+					_, dhidden_state_generated = dtrain(cstep, sample[0], 0, dhidden_state_generated)
+					dcost, dhidden_state_real = dtrain(cstep, mstep, 1, dhidden_state_real)
+
+
+				every_possible_output[-1][0:10] = every_possible_output[best][0:10]
+				"""
 				# generate samples
 				samples, ghidden_state, grads = ggen(cstep, ghidden_state)
 				# pass them through the discriminator
@@ -376,6 +455,7 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 				# train discriminator on the correct timestep
 				if pause_d_training: _, dhidden_state = dpass(cstep, mstep, dhidden_state)
 				else: dcost, dhidden_state = dtrain(cstep, mstep, 1, dhidden_state)
+				"""
 			#check whether we should pause training for one network based on how good/bad the generated results are relative
 			avg_best = np.mean(np.array(best_g))
 			avg_worst = np.mean(np.array(worst_g))
@@ -388,9 +468,13 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 				if not pause_d_training: print "Current dcost: ", dcost
 
 
-		
+		# Every 10 batches, store weights and output a piece
+		if batch %10 == 0:
+			save_weights(gmodel, OUTPUT_DIR + "/Gweights_Batch_" + str(batch) + ".p")
+			save_weights(dmodel, OUTPUT_DIR + "/Dweights_Batch_" + str(batch) + ".p")
+			generate_sample_output(chords[0], ggen, dpass)
 			
 
 if __name__=='__main__':
-	build_and_train_GAN(gweight_file='/home/sam/misc_code/adversarial_music/output/2016-07-15 09:26:49.172497/Gweights_Batch_10.p',
-						dweight_file='/home/sam/misc_code/adversarial_music/output/2016-07-15 09:26:49.172497/Dweights_Batch_10.p', start_batch=10)
+	build_and_train_GAN()#gweight_file='/home/sam/misc_code/adversarial_music/output/2016-07-14 16:11:37.997571/Dweights_Batch_10.p', 
+						#dweight_file='/home/sam/misc_code/adversarial_music/output/2016-07-14 16:11:37.997571/Gweights_Batch_10.p')
