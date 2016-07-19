@@ -18,11 +18,11 @@ from adversarial_music import *
 
 TRAINING_DIR = "/home/sam/misc_code/adversarial_music/data/ii-V-I_leadsheets"
 OUTPUT_DIR = "/home/sam/misc_code/adversarial_music/output/nosampling" + str(datetime.datetime.now())
-NUM_SAMPLES_PER_TIMESTEP = 1
-MAX_NUM_BATCHES = 250
-VERBOSE = True
-OUTPUT = False
-TRAINING_METHOD = 'adadelta'
+NUM_SAMPLES_PER_TIMESTEP = 1 # when 
+MAX_NUM_BATCHES = 250 # the program will halt training after this number of passes through the data
+VERBOSE = True # whether or not plots will appear every 10 epochs
+OUTPUT = True # whether or not weights/outputs will be saved every 10 epochs
+TRAINING_METHOD = 'adadelta' # optimizer to use when training
 
 DIFF_BOUND = .3
 
@@ -219,6 +219,18 @@ def generate_sample_output(chords, ggen, dpass, batch, output_directory=OUTPUT_D
 	chords_for_ls = [(chord[-1], list(chord[:-1])) for chord in chords]
 	ls.write_leadsheet(chords_for_ls, pitchduration_melody, output_directory + "/Batch_" + str(batch) + ".ls")
 
+
+
+def plot_pitches_over_time(data, label):
+	fig, ax = plt.subplots()
+	heatmap = ax.pcolor(data.T, cmap=plt.cm.Blues_r)
+	plt.title(label)
+	plt.xlabel('timesteps')
+	plt.ylabel('pitches')
+	if OUTPUT: plt.savefig(OUTPUT_DIR + '/' + label)
+	else: plt.show()
+
+
 def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None, dweight_file=None, start_batch=1):
 	
 	print "Loading data..."
@@ -253,6 +265,7 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 		print "Batch ", batch
 		pause_d_training, pause_g_training = False, False
 		j = 0
+		p = True
 		# for each piece
 		for c,m in zip(chords, melodies):
 			ghidden_state = None
@@ -262,9 +275,10 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 			worst_g = []
 			j+=1
 
-			if VERBOSE and batch % 10 == 0:
-				quality = []
-				log_probability_across_time = []
+			if VERBOSE and batch % 10 == 0 and p:
+				quality = np.zeros([len(c), len(every_possible_output)])
+				log_probability_across_time = np.zeros([len(c), len(every_possible_output)])
+				k = 0
 			# for each timestep
 			for cstep, mstep in zip(c,m):
 				# so we're not generating samples from the generator, so we train the discriminator first
@@ -273,45 +287,26 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 					r, _ = dpass(cstep, every_possible_output[i], dhidden_state_generated)
 					results[i] = r[1]
 				if not pause_g_training:
-					if VERBOSE and batch % 10 == 0:
+					if VERBOSE and batch % 10 == 0 and p:
 						gcost, log_probability, _ = gtrain(cstep, results, ghidden_state, transparent=True)
-						quality += [results]
-						log_probability_across_time += [log_probability]
+						quality[k] = results
+						log_probability_across_time[k] = log_probability
+						k+=1
 					else: 
 						gcost, _ = gtrain(cstep, results, ghidden_state)
 				sample, ghidden_state = gpass(cstep, ghidden_state)
 				if not pause_d_training:
-					_, dhidden_state_generated = dtrain(cstep, sample[0], 0, dhidden_state_generated)
-					dcost, dhidden_state_real = dtrain(cstep, mstep, 1, dhidden_state_real)
+					dcost = [0,0]
+					dcost[0], dhidden_state_generated = dtrain(cstep, sample[0], 0, dhidden_state_generated)
+					dcost[1], dhidden_state_real = dtrain(cstep, mstep, 1, dhidden_state_real)
 
 				
 				every_possible_output[-1][:10] = sample[0][:10] 
-				"""
-				# generate samples
-				samples, ghidden_state, grads = ggen(cstep, ghidden_state)
-				# pass them through the discriminator
-				results = np.zeros(len(samples))
-				for i in range(len(samples)): 
-					r, _ = dpass(cstep, samples[i], dhidden_state)
-					results[i] = r[1] # certainty that it is real
-				# update generator based on results
-				if not pause_g_training: gupd(grads, results)
-				# train discriminator on the best generated timestep
-
-				best = np.argmax(results)
-				worst = np.argmin(results)
-				best_g += [results[best]]
-				worst_g += [results[worst]]
-				if not pause_d_training: dtrain(cstep, samples[best], 0, dhidden_state)
-				# train discriminator on the correct timestep
-				if pause_d_training: _, dhidden_state = dpass(cstep, mstep, dhidden_state)
-				else: dcost, dhidden_state = dtrain(cstep, mstep, 1, dhidden_state)
-				"""
-			if VERBOSE and batch % 10 == 0:
-				plt.plot(quality)
-				plt.show()
-				plt.plot(log_probability_across_time)
-				plt.show()
+				
+			if VERBOSE and batch % 10 == 0 and p:
+				plot_pitches_over_time(quality, 'discriminator_output_epoch' + str(batch))
+				plot_pitches_over_time(log_probability_across_time, 'generator_probs_epoch' + str(batch))
+				p = False
 
 
 			#check whether we should pause training for one network based on how good/bad the generated results are relative
@@ -327,5 +322,5 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 			
 
 if __name__=='__main__':
-	build_and_train_GAN(start_batch=10)#gweight_file='/home/sam/misc_code/adversarial_music/output/2016-07-14 16:11:37.997571/Dweights_Batch_10.p', 
+	build_and_train_GAN()#gweight_file='/home/sam/misc_code/adversarial_music/output/2016-07-14 16:11:37.997571/Dweights_Batch_10.p', 
 						#dweight_file='/home/sam/misc_code/adversarial_music/output/2016-07-14 16:11:37.997571/Gweights_Batch_10.p')
