@@ -11,6 +11,7 @@ import datetime
 import os
 import pickle
 import matplotlib.pyplot as plt
+import argparse
 
 import constants
 import leadsheet as ls
@@ -28,22 +29,41 @@ DIFF_BOUND = .3
 
 circleofthirds_bits = 13
 
+# you can use command line arguments to change from the defaults above
+parser = argparse.ArgumentParser(description='Use Generative Adversarial Networks to generate music based on training data.')
+parser.add_argument('-t', '--training_dir', action='store', dest='training_dir', 
+	help='directory of .ls files to train on.', default=TRAINING_DIR)
+parser.add_argument('-o', '--output_dir', action='store', dest='output_dir', 
+	help='directory to place output files in (if output is true), if directory does not exist it will be created.', default=OUTPUT_DIR)
+parser.add_argument('-b', '--max_num_batches', action='store', dest='max_num_batches',
+	help='maximum number of batches to run before terminating.', type=int, default=MAX_NUM_BATCHES)
+parser.add_argument('-s', '--num_samples_per_timestep', action='store', dest='num_samples_per_timestep',
+	help='number of samples to take from the generator in selecting a new timestep', type=int, default=NUM_SAMPLES_PER_TIMESTEP)
+parser.add_argument('-v', '--verbose', action='store_true', dest='verbose',
+	help='enables outputting of progress text via stdout and graphs via matplotlib.pyplot.show() or saved, if output is also true', default=False)
+parser.add_argument('--suppress_output', action='store_true', dest='suppress_output',
+	help='stop the program from outputting any files, useful for testing', default=False)
+parser.add_argument('-tm', '--training_method', action='store', dest='training_method',
+	help='specify the gradient descent optimizer for theano_lstm', default=TRAINING_METHOD)
 
-def gen_possible_circleofthirds_notes():
-	note_possibilities = np.zeros([4*3*3+2, 13])
-	n = 0
-	for i in range(4):
-		for j in range(4,7):
-			for k in range(7,10):
-				note_possibilities[n][i] = 1
-				note_possibilities[n][j] = 1
-				note_possibilities[n][k] = 1
-				note_possibilities[n][12] = 1
-				n+=1
-	note_possibilities[n][10] = 1
-	n += 1
-	note_possibilities[n][11] = 1
-	return note_possibilities
+
+args = parser.parse_args()
+
+TRAINING_DIR = args.training_dir
+OUTPUT_DIR = args.output_dir
+MAX_NUM_BATCHES = args.max_num_batches
+NUM_SAMPLES_PER_TIMESTEP = args.num_samples_per_timestep
+VERBOSE = args.verbose
+OUTPUT = not args.suppress_output
+TRAINING_METHOD = args.training_method
+
+
+
+
+
+
+
+
 
 
 # I want to start with a generator which takes a random prior and a chord and feeds it through LSTM layers to get a distribution over possible output notes for the timestep
@@ -131,7 +151,7 @@ def build_generator(layer_sizes):
 			return cost, new_hiddens
 	return model, generative_pass_wrapper, training_pass_wrapper
 
-	
+
 
 # the discriminator should take in a melody timestep, a chord and its internal state and get a certainty of it being real
 def build_discriminator(layer_sizes):
@@ -158,8 +178,6 @@ def build_discriminator(layer_sizes):
 
 	# cost is the negative log liklihood that the correct answer (real or not) was chosen, I have no idea why result is 2d
 	cost = -T.log(result[0][isreal])
-
-	theano.grad(cost, model.params)
 
 	updates, gsums, xsums, lr, max_norm = create_optimization_updates(cost, model.params, method=TRAINING_METHOD)
 	forward_pass = theano.function([chord, melody] + prev_hiddens, [result] + new_hiddens, allow_input_downcast=True)
@@ -221,15 +239,6 @@ def generate_sample_output(chords, ggen, dpass, batch, output_directory=OUTPUT_D
 
 
 
-def plot_pitches_over_time(data, label):
-	fig, ax = plt.subplots()
-	heatmap = ax.pcolor(data.T, cmap=plt.cm.Blues_r)
-	plt.title(label)
-	plt.xlabel('timesteps')
-	plt.ylabel('pitches')
-	if OUTPUT: plt.savefig(OUTPUT_DIR + '/' + label)
-	else: plt.show()
-
 
 def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None, dweight_file=None, start_batch=1):
 	
@@ -237,7 +246,7 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 	chords, melodies = load_data(training_data_directory)
 	print "Building the model..."
 	gmodel, gpass, gtrain = build_generator([100, 200, 100, circleofthirds_bits])
-	dmodel, dpass, dtrain = build_discriminator([100,50, 2])
+	dmodel, dpass, dtrain = build_discriminator([100, 200,100, 2])
 
 	if gweight_file is not None:
 		load_model_from_weights(gmodel, gweight_file)
@@ -263,14 +272,13 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 			save_weights(dmodel, OUTPUT_DIR + "/Dweights_Batch_" + str(batch) + ".p")
 			generate_sample_output(chords[0], gpass, dpass, batch)
 		print "Batch ", batch
-		pause_d_training, pause_g_training = False, False
+		pause_d_training, pause_g_training = True, False
 		j = 0
 		p = True
 		# for each piece
 		for c,m in zip(chords, melodies):
 			ghidden_state = None
-			dhidden_state_real = None
-			dhidden_state_generated = None
+			dhidden_state = None
 			best_g = []
 			worst_g = []
 			j+=1
@@ -282,11 +290,12 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 			# for each timestep
 			for cstep, mstep in zip(c,m):
 				# so we're not generating samples from the generator, so we train the discriminator first
-				results = np.zeros(every_possible_output.shape[0])
-				for i in range(len(every_possible_output)):
-					r, _ = dpass(cstep, every_possible_output[i], dhidden_state_generated)
-					results[i] = r[1]
 				if not pause_g_training:
+					results = np.zeros(every_possible_output.shape[0])
+					for i in range(len(every_possible_output)):
+						r, _ = dpass(cstep, every_possible_output[i], dhidden_state)
+						results[i] = r[1]
+				
 					if VERBOSE and batch % 10 == 0 and p:
 						gcost, log_probability, _ = gtrain(cstep, results, ghidden_state, transparent=True)
 						quality[k] = results
@@ -297,14 +306,16 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 				sample, ghidden_state = gpass(cstep, ghidden_state)
 				if not pause_d_training:
 					dcost = [0,0]
-					dcost[0], dhidden_state_generated = dtrain(cstep, sample[0], 0, dhidden_state_generated)
-					dcost[1], dhidden_state_real = dtrain(cstep, mstep, 1, dhidden_state_real)
+					dcost[0], _ = dtrain(cstep, sample[0], 0, dhidden_state_generated)
+					dcost[1], dhidden_state = dtrain(cstep, mstep, 1, dhidden_state_real)
 
 				
 				every_possible_output[-1][:10] = sample[0][:10] 
 				
 			if VERBOSE and batch % 10 == 0 and p:
+				print quality
 				plot_pitches_over_time(quality, 'discriminator_output_epoch' + str(batch))
+				print log_probability_across_time
 				plot_pitches_over_time(log_probability_across_time, 'generator_probs_epoch' + str(batch))
 				p = False
 

@@ -149,3 +149,28 @@ def load_model_from_weights(model, filepath):
 		assert len(new_params[i]) == model.params[i].get_value().shape[0]
 		model.params[i].set_value(new_params[i])
 
+def gen_possible_circleofthirds_notes():
+	note_possibilities = np.zeros([4*3*3+2, 13])
+	n = 0
+	for i in range(4):
+		for j in range(4,7):
+			for k in range(7,10):
+				note_possibilities[n][i] = 1
+				note_possibilities[n][j] = 1
+				note_possibilities[n][k] = 1
+				note_possibilities[n][12] = 1
+				n+=1
+	note_possibilities[n][10] = 1
+	n += 1
+	note_possibilities[n][11] = 1
+	return note_possibilities
+
+def plot_pitches_over_time(data, label):
+	fig, ax = plt.subplots()
+	heatmap = ax.pcolor(data.T, cmap=plt.cm.Blues_r)
+	plt.title(label)
+	plt.xlabel('timesteps')
+	plt.ylabel('pitches')
+	if OUTPUT: plt.savefig(OUTPUT_DIR + '/' + label)
+	else: plt.show()
+
