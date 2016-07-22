@@ -10,6 +10,7 @@ import numpy as np
 import datetime
 import os
 import pickle
+import matplotlib.pyplot as plt
 
 import constants
 import leadsheet as ls
@@ -114,7 +115,7 @@ def load_data(directory=TRAINING_DIR):
 	for file in listdir(directory):
 		c, m = ls.parse_leadsheet(directory + "/" + file)
 		for i in range(len(c)):
-			c[i] = c[i][1] + [c[i][0]] # deal with the root of the chord
+			c[i] = np.append(c[i][1], pitchduration_to_circleofthirds(c[i][0],1)[0]) # deal with the root of the chord
 		if len(chords) == 0:
 			chords = np.array([c])
 		else:

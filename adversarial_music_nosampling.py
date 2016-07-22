@@ -58,14 +58,6 @@ OUTPUT = not args.suppress_output
 TRAINING_METHOD = args.training_method
 
 
-
-
-
-
-
-
-
-
 # I want to start with a generator which takes a random prior and a chord and feeds it through LSTM layers to get a distribution over possible output notes for the timestep
 # Then, I sample from that distribution, get notes and save the gradients to increase the probability of those notes somewhere. Then, I feed that note into the discriminator, and if it fools it, I update according to that gradient
 # the issue is that a single note will always fool the discriminator. Maybe I should scale the adjustment with the number of timesteps it fools the discriminator by?
@@ -74,12 +66,12 @@ TRAINING_METHOD = args.training_method
 def build_generator(layer_sizes):
 	rng = T.shared_randomstreams.RandomStreams()
 
-	prior = rng.uniform(size=[13]) # the random prior to keep things interesting, let's say it's a vector of 13 numbers
-	chord = T.vector('chord') # each chord is a 13 element array with one hot for notes and the root as a midi number
+	prior = rng.uniform(size=[25]) # the random prior to keep things interesting, let's say it's a vector of 25 numbers
+	chord = T.vector('chord') # each chord is a length 25 bit vector
 	
 
 	# model - for now just one hidden layer and an output layer
-	model = StackedCells(26, celltype=LSTM, layers=layer_sizes, activation=T.tanh)
+	model = StackedCells(50, celltype=LSTM, layers=layer_sizes, activation=T.tanh)
 	model.layers[0].in_gate2.activation = lambda x: x # we don't want to tanh the input, also in_gate2 is the layer within an LSTM layer that actually accepts input from the previous layer
 
 	# I have no idea how to pass None into forward the first time, so I copied the code from theano_lstm to intialize the hiddens. If you call init_gen_pass, it'll use these
@@ -161,7 +153,7 @@ def build_discriminator(layer_sizes):
 
 	
 
-	model = StackedCells(26, celltype=LSTM, layers=layer_sizes, activation=T.tanh) # outputs real or fake, 2 bits
+	model = StackedCells(38, celltype=LSTM, layers=layer_sizes, activation=T.tanh) # outputs real or fake, 2 bits
 	model.layers[0].in_gate2.activation = lambda x: x
 
 	init_hiddens = [(T.repeat(T.shape_padleft(layer.initial_hidden_state),
@@ -272,7 +264,7 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 			save_weights(dmodel, OUTPUT_DIR + "/Dweights_Batch_" + str(batch) + ".p")
 			generate_sample_output(chords[0], gpass, dpass, batch)
 		print "Batch ", batch
-		pause_d_training, pause_g_training = True, False
+		pause_d_training, pause_g_training = False, False
 		j = 0
 		p = True
 		# for each piece
