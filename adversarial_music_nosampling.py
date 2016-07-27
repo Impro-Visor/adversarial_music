@@ -226,7 +226,7 @@ def generate_sample_output(chords, ggen, dpass, batch, output_directory=OUTPUT_D
 	for i in range(len(pitchduration_melody)):
 		if pitchduration_melody[i][0] is not None:
 			pitchduration_melody[i] = (int(pitchduration_melody[i][0]), pitchduration_melody[i][1])
-	chords_for_ls = [(chord[-1], list(chord[:-1])) for chord in chords]
+	chords_for_ls = [(circleofthirds_to_pitchduration(np.array([chord[12:]]))[0][0]-60, list(chord[:12])) for chord in chords[0]]
 	ls.write_leadsheet(chords_for_ls, pitchduration_melody, output_directory + "/Batch_" + str(batch) + ".ls")
 
 
