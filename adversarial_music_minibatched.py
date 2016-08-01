@@ -99,26 +99,25 @@ def build_discriminator(layer_sizes):
 	melody = T.matrix('melody') # 13 bits for circleofthirds
 	isreal = T.iscalar('isreal?') # 1 if real, 0 if fake - necessary for training
 
-
-	possible_circleofthirds_notes = theano.compile.sharedvalue.shared(gen_possible_circleofthirds_notes(), name='possible notes')
+	paddedmelody = T.concatenate((T.zeros([1,13]), melody))
 
 	model = StackedCells(38, celltype=LSTM, layers=layer_sizes, activation=T.tanh) # outputs real or fake, 2 bits
 	model.layers[0].in_gate2.activation = lambda x: x
 	model.layers.append(Layer(layer_sizes[-1], 2, lambda x: T.nnet.softmax(x)))
 
-	def step(c, prev_m, m, *prev_hiddens):
-		T.set_subtensor(possible_circleofthirds_notes[-1,:10], prev_m[:10])
+	def step(c, prev_m, m, possible_circleofthirds_notes, *prev_hiddens):
+		possible_circleofthirds_notes = T.set_subtensor(possible_circleofthirds_notes[-1,:10], prev_m[:10])
 		new_hiddens = model.forward(T.concatenate((m,c)), prev_hiddens)
-		quality_of_each_output = T.zeros(possible_circleofthirds_notes.get_value().shape[0])
-		for i in range(len(possible_circleofthirds_notes.get_value())):
+		quality_of_each_output = T.zeros(38) # Magic Number, beware changing note encoding
+		for i in range(38):
 			# measure the quality of each possible output
 			quality_of_each_output = T.set_subtensor(quality_of_each_output[i], 
-				model.forward(T.concatenate((possible_circleofthirds_notes.get_value()[i], c)), prev_hiddens)[-1][0][1])
-		return [quality_of_each_output, m] + new_hiddens
+				model.forward(T.concatenate((possible_circleofthirds_notes[i], c)), prev_hiddens)[-1][0][1])
+		return [quality_of_each_output, possible_circleofthirds_notes] + new_hiddens
 
 	results, updates = theano.scan(step, n_steps=chord.shape[0],
-		outputs_info=[None, dict(initial=T.zeros(13), taps=[-1])] + [dict(initial=layer.initial_hidden_state, taps=[-1]) if hasattr(layer, 'initial_hidden_state') else None for layer in model.layers],
-		sequences=[chord, melody])
+		outputs_info=[None, gen_possible_circleofthirds_notes()] + [dict(initial=layer.initial_hidden_state, taps=[-1]) if hasattr(layer, 'initial_hidden_state') else None for layer in model.layers],
+		sequences=[T.concatenate((chord, T.zeros([1,25]))), dict(input=paddedmelody, taps=[0,1])])
 	# function that returns the quality of each possible output in the next timestep
 	predictive_pass = theano.function([chord, melody], [results[0]], allow_input_downcast=True)
 	forward_pass = theano.function([chord, melody], [results[-1][:,0,1]], allow_input_downcast=True)
@@ -154,7 +153,7 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 	print "Building the model..."
 	rng = T.shared_randomstreams.RandomStreams()
 	gmodel, ggen, gupd = build_generator([100, 200, 100], rng)
-	dmodel, dpred, dpass, dtrain = build_discriminator([100,200,100])
+	dmodel, dpred, dpass, dtrain = build_discriminator([50,100,50])
 
 	a = T.vector()
 	b = sample_from_circleofthirds_probabilities(a, rng, 1)[0]
@@ -173,6 +172,7 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 	os.mkdir(OUTPUT_DIR)
 	gcost_init = 0
 	dcost_init = 0
+	piece_length = 12
 	print "Training"
 	for batch in range(start_batch, MAX_NUM_BATCHES):
 
@@ -180,7 +180,7 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 		if batch %10 == 0:
 			save_weights(gmodel, OUTPUT_DIR + "/Gweights_Batch_" + str(batch) + ".p")
 			save_weights(dmodel, OUTPUT_DIR + "/Dweights_Batch_" + str(batch) + ".p")
-			generate_sample_output(chords, melodies, ggen, dpass, batch)
+			generate_sample_output(chords, ggen, dpass, batch)
 
 		print "Batch ", batch
 		dpause, gpause = False, False
@@ -188,6 +188,8 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 		p = True
 		# for each piece
 		for c,m in zip(chords, melodies):
+			c = c[:piece_length]
+			m = m[:piece_length]
 			ghidden_state = None
 			dhidden_state = None
 			best_g = []
@@ -199,7 +201,7 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 			# train the discriminator
 			if not dpause:
 				generated_m = ggen(c)
-				dcost_real = dtrain(c, m,1)[0]
+				dcost_real = dtrain(c, m, 1)[0]
 				dcost_generated = dtrain(c, generated_m, 0)[0]
 				dcost_avg = (dcost_real + dcost_generated) / 2
 				if dcost_init == 0: dcost_init = dcost_avg
@@ -210,11 +212,13 @@ def build_and_train_GAN(training_data_directory=TRAINING_DIR, gweight_file=None,
 				gcost = gupd(c, m, quality_of_each_output_for_each_timestep)[0]
 				if gcost_init == 0: gcost_init = gcost
 			# pause if either one is super far ahead
-			dpause = dcost_avg/ dcost_init < 0.5 * gcost / gcost_init
-			gpause = gcost/ gcost_init < 0.5 * dcost_avg / dcost_init
+			dpause = dcost_avg/ dcost_init < 0.75 * gcost / gcost_init
+			gpause = gcost/ gcost_init < 0.75 * dcost_avg / dcost_init
+
+			if gcost < -np.log(0.5) * piece_length and piece_length < len(chords[0]): piece_length+=12
 
 			
-			if j % 100 == 0:
+			if j % 300 == 0:
 				_, prob = gupd(c, m, quality_of_each_output_for_each_timestep, True)
 				plot_pitches_over_time(quality_of_each_output_for_each_timestep, "batch "+ str(batch)+ "discriminator output: real" + str(j), OUTPUT_DIR)
 				quality_of_each_output_for_each_timestep = dpred(c, generated_m)[0]

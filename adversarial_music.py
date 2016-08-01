@@ -20,6 +20,7 @@ OUTPUT_DIR = "/home/sam/misc_code/adversarial_music/output/" + str(datetime.date
 NUM_SAMPLES_PER_TIMESTEP = 20
 MAX_NUM_BATCHES = 250
 VERBOSE = False
+OUTPUT = True
 TRAINING_METHOD = 'adagrad'
 
 UPBOUND = .65
@@ -42,6 +43,9 @@ def pitchduration_to_circleofthirds(pitch, duration):
 		if octave > 2: 
 			if VERBOSE: print "Warning, note was rounded down"
 			octave = 2
+		if octave < 0:
+			if VERBOSE: print "Warning, note was rounded up"
+			octave = 0
 		note[:, minor_third] = 1
 		note[:, 4 + major_third] = 1
 		note[:, 7 + octave] = 1
@@ -115,7 +119,7 @@ def load_data(directory=TRAINING_DIR):
 	for file in listdir(directory):
 		c, m = ls.parse_leadsheet(directory + "/" + file)
 		for i in range(len(c)):
-			c[i] = np.append(c[i][1], pitchduration_to_circleofthirds(c[i][0],1)[0]) # deal with the root of the chord
+			c[i] = np.append(c[i][1], pitchduration_to_circleofthirds(c[i][0] + 60,1)[0]) # deal with the root of the chord
 		if len(chords) == 0:
 			chords = np.array([c])
 		else:
@@ -166,12 +170,15 @@ def gen_possible_circleofthirds_notes():
 	note_possibilities[n][11] = 1
 	return note_possibilities
 
-def plot_pitches_over_time(data, label):
+def plot_pitches_over_time(data, label, output_dir):
 	fig, ax = plt.subplots()
 	heatmap = ax.pcolor(data.T, cmap=plt.cm.Blues_r)
 	plt.title(label)
+	plt.colorbar(heatmap)
 	plt.xlabel('timesteps')
 	plt.ylabel('pitches')
-	if OUTPUT: plt.savefig(OUTPUT_DIR + '/' + label)
+	if OUTPUT: 
+		plt.savefig(output_dir + '/' + label)
+		plt.close()
 	else: plt.show()
 
